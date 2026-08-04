@@ -13,6 +13,7 @@ from generative_recommenders.common import (
     blackwell_tlx_unavailable,
     generate_sparse_seq_len,
     HammerKernel,
+    set_use_runtime_max_seq_len,
 )
 from generative_recommenders.ops.cpp.cuda_hstu_attention import cuda_hstu_mha
 from generative_recommenders.ops.hstu_attention import delta_hstu_mha, hstu_mha
@@ -71,6 +72,7 @@ def _flops(
 @click.option("--heads", type=int, default=4)
 @click.option("--attn-dim", type=int, default=128)
 @click.option("--hidden-dim", type=int, default=128)
+@click.option("--min-seq-len-log2", type=int, default=8)
 @click.option("--max-seq-len-log2", type=int, default=13)
 @click.option("--data-type", type=str, default="bf16")
 @click.option("--seq-sparsity", type=float, default=0.95)
@@ -91,11 +93,19 @@ def _flops(
 @click.option("--triton-enable-tma", type=bool, default=False)
 @click.option("--dynamic-attn-scale", type=bool, default=False)
 @click.option("--num-softmax-heads", type=int, default=0)
+@click.option(
+    "--exact-seq-len",
+    type=int,
+    default=0,
+    help="If > 0, benchmark this single sequence length instead of the "
+    "power-of-two log2 sweep. Use for target workloads like 12288.",
+)
 def main(  # noqa: C901
     batch_size: int,
     heads: int,
     attn_dim: int,
     hidden_dim: int,
+    min_seq_len_log2: int,
     max_seq_len_log2: int,
     data_type: str,
     seq_sparsity: float,
@@ -116,7 +126,20 @@ def main(  # noqa: C901
     triton_enable_tma: bool,
     dynamic_attn_scale: bool,
     num_softmax_heads: int,
+    exact_seq_len: int,
 ) -> Optional[Tuple[List[triton.testing.Benchmark], List[pd.DataFrame]]]:
+    if exact_seq_len <= 0 and min_seq_len_log2 >= max_seq_len_log2:
+        raise click.BadParameter(
+            "must be less than --max-seq-len-log2",
+            param_hint="--min-seq-len-log2",
+        )
+
+    # Bucket the TLX autotune key by the runtime max sequence length (rounded down
+    # to a power of 2) so each benchmarked shape tunes its own config, instead of
+    # collapsing every length to AUTOTUNE_MAX_SEQ_LEN == 1 and reusing the config
+    # tuned on the first (smallest) shape.
+    set_use_runtime_max_seq_len(True)
+
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
     if data_type == "fp32":
@@ -128,9 +151,16 @@ def main(  # noqa: C901
     else:
         raise ValueError(f"Unsupported data type: {data_type}.")
 
-    line_vals = ["triton", "flash_cuda_jagged"]
-    line_names = ["triton", "flash_cuda_jagged"]
-    styles = [("blue", "-"), ("green", "-")]
+    # The standard "triton" provider has no softmax path, so exclude it from
+    # softmax runs and compare TLX against ragged Triton and flash_cuda_jagged.
+    if num_softmax_heads > 0:
+        line_vals = ["flash_cuda_jagged"]
+        line_names = ["flash_cuda_jagged"]
+        styles = [("green", "-")]
+    else:
+        line_vals = ["triton", "flash_cuda_jagged"]
+        line_names = ["triton", "flash_cuda_jagged"]
+        styles = [("blue", "-"), ("green", "-")]
     if bench_pytorch:
         line_vals.append("pytorch")
         line_names.append("PyTorch")
@@ -152,10 +182,15 @@ def main(  # noqa: C901
         modes.append("bwd")
     assert len(modes) > 0
 
+    seq_len_vals = (
+        [exact_seq_len]
+        if exact_seq_len > 0
+        else [2**i for i in range(min_seq_len_log2, max_seq_len_log2)]
+    )
     configs: List[triton.testing.Benchmark] = [
         triton.testing.Benchmark(
             x_names=["seq_len"],
-            x_vals=[2**i for i in range(8, max_seq_len_log2)],
+            x_vals=seq_len_vals,
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_names,
@@ -270,7 +305,11 @@ def main(  # noqa: C901
             device=torch.device("cuda"),
         ).uniform_(0.5, 1.0)
 
-        if bench_backward:
+        # Only the backward sweep needs autograd. Requiring grad in the forward
+        # sweep too makes every forward call save activations, which at large
+        # (batch, seq_len) doubles memory across all providers and OOMs before
+        # the backward sweep even starts.
+        if bench_backward and mode == "bwd":
             q = q.requires_grad_(True)
             k = k.requires_grad_(True)
             v = v.requires_grad_(True)
@@ -372,14 +411,20 @@ def main(  # noqa: C901
                     num_targets=num_targets,
                     max_attn_len=max_attn_len,
                     contextual_seq_len=contextual_seq_len,
-                    sort_by_length=True,
+                    sort_by_length=provider != "tlx",
+                    num_softmax_heads=num_softmax_heads,
                     kernel=_get_kernel(provider),
                     enable_tma=triton_enable_tma,
                 )
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)  # noqa E731
+            fn = lambda: torch.autograd.grad(  # noqa E731
+                outputs=o,
+                inputs=(q, k, v),
+                grad_outputs=do,
+                retain_graph=True,
+            )
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
         all_flops = _flops(
             batch_size, seq_len, attn_dim, hidden_dim, heads, seq_offsets, mode

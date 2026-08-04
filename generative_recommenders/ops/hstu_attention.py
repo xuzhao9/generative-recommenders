@@ -113,6 +113,7 @@ def hstu_mha(
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
+    num_softmax_heads: int = 0,
     sort_by_length: bool = False,
     kernel: HammerKernel = HammerKernel.PYTORCH,
     enable_tma: bool = False,
@@ -126,6 +127,10 @@ def hstu_mha(
         torch._assert(v.shape[0] == q.shape[0], "wrong v shape[0]")
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
+        torch._assert(
+            num_softmax_heads == 0 or num_softmax_heads == H,
+            "num_softmax_heads must be 0 or H",
+        )
 
     if kernel in [HammerKernel.TRITON, HammerKernel.TLX, HammerKernel.TRITON_CC]:
         if not is_fx_tracing() and kernel == HammerKernel.TRITON:
@@ -170,11 +175,12 @@ def hstu_mha(
             k=k,
             v=v,
             seq_offsets=seq_offsets,
-            attn_scale=torch.tensor(1.0 / max_seq_len).to(q.device),
+            attn_scale=torch.tensor(1.0 / max_seq_len, device=q.device),
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             sort_by_length=sort_by_length,
+            num_softmax_heads=num_softmax_heads,
         )
     elif kernel == HammerKernel.TRITON_CC:
         return triton_cc_hstu_mha(
