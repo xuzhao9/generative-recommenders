@@ -653,7 +653,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
                     K_block_ptr = tl.advance(K_block_ptr, (0, offset))
                     V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
                 for start_delta in tl.range(
-                    low_delta, high_delta, BLOCK_N, num_stages=0
+                    low_delta, high_delta, BLOCK_N, num_stages=1
                 ):
                     acc += _hstu_attn_fwd_one_block(
                         start_n=start_delta,
@@ -745,7 +745,7 @@ def _hstu_attn_fwd_compute_main_loop_tlx(  # noqa C901
     # pyrefly: ignore [missing-attribute]
     q_tile = tlx.local_view(q_tiles, cid)
 
-    for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=0):
+    for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=1):
         buf_id = loop_trip_cnt % NUM_BUFFERS
         # buffers in a row share the same phase
         kv_phase = (loop_trip_cnt // NUM_BUFFERS) % 2
@@ -951,7 +951,7 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
 
     loop_trip_cnt += 1
 
-    for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=0):
+    for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=1):
         start_n = tl.multiple_of(start, BLOCK_N)
         offs_n = offs_n_start + start_n
 
@@ -1358,7 +1358,7 @@ def _hstu_attn_fwd_load_Q_K_V(
     if uih_end < start_m:
         low_delta = start_m
         high_delta = start_m + BLOCK_M
-        for start_delta in tl.range(low_delta, high_delta, BLOCK_N, num_stages=0):
+        for start_delta in tl.range(low_delta, high_delta, BLOCK_N, num_stages=1):
             # pyre-ignore[58]
             buf_id = loop_trip_cnt % NUM_BUFFERS
             # buffers in a row share the same phase
