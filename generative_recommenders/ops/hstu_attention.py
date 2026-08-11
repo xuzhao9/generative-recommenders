@@ -175,7 +175,11 @@ def hstu_mha(
             k=k,
             v=v,
             seq_offsets=seq_offsets,
-            attn_scale=torch.tensor(1.0 / max_seq_len, device=q.device),
+            attn_scale=(
+                None
+                if num_softmax_heads > 0
+                else torch.tensor(1.0 / max_seq_len, device=q.device)
+            ),
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
