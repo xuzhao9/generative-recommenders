@@ -2,7 +2,7 @@
 
 # pyre-strict
 
-# cmd: buck2 run @//mode/opt -c fbcode.enable_gpu_sections=true -c fbcode.platform010_cuda_version=12.8 -c fbcode.nvcc_arch=b200a  //generative_recommenders/ops/cpp/tests:hstu_mha_cpu_test
+# cmd: buck2 run @//mode/opt -c fbcode.enable_gpu_sections=true -m ovr_config//third-party/cuda/constraints:12.8 -c fbcode.nvcc_arch=b200a  //generative_recommenders/ops/cpp/tests:hstu_mha_cpu_test
 
 import unittest
 
