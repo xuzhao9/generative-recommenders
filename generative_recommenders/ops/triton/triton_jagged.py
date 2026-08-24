@@ -45,6 +45,7 @@ except OSError:
 
 CUDA_JAGGED_DENSE_BMM_FWD = False
 CUDA_JAGGED_DENSE_BMM_BWD = False
+USE_SPLITK_JAGGED_DENSE_BMM_BWD = False
 
 SPLIT_2D_JAGGED_KERNEL = None
 GLN_MUL_DROPOUT_KERNEL = None
@@ -69,6 +70,15 @@ def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
 def get_cuda_jagged_dense_bmm_bwd() -> bool:
     # currently only supports H100
     return CUDA_JAGGED_DENSE_BMM_BWD and is_sm90()
+
+
+def set_use_splitk_jagged_dense_bmm_bwd(value: bool) -> None:
+    global USE_SPLITK_JAGGED_DENSE_BMM_BWD
+    USE_SPLITK_JAGGED_DENSE_BMM_BWD = value
+
+
+def get_use_splitk_jagged_dense_bmm_bwd() -> bool:
+    return USE_SPLITK_JAGGED_DENSE_BMM_BWD
 
 
 def set_split_2d_jagged_kernel(value: Optional[str]) -> None:
@@ -546,6 +556,130 @@ def _jagged_jagged_bmm_reduce_sum(
             )
 
 
+def _get_bmm_reduce_sum_splitk_configs() -> List[triton.Config]:
+    return [
+        triton.Config(
+            {
+                "K_CHUNK": k_chunk,
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "BLOCK_K": 64,
+            },
+            num_warps=4,
+            num_stages=3,
+        )
+        for k_chunk in (8192, 16384)
+        for block_m, block_n in ((64, 64), (128, 128))
+    ]
+
+
+@triton_autotune(
+    configs=_get_bmm_reduce_sum_splitk_configs(),
+    key=["M", "N", "AUTOTUNE_MAX_SEQ_LEN", "AUTOTUNE_B", "REDUCE_JAGGEDB"],
+    reset_to_zero=["Out", "ReduceOut"],
+)
+@triton.jit
+def _jagged_jagged_bmm_reduce_sum_splitk(  # noqa: TR001
+    seq_offsets,
+    JaggedA,
+    JaggedB,
+    Out,
+    ReduceOut,
+    M,
+    N,
+    MAX_SEQ_LEN,
+    AUTOTUNE_MAX_SEQ_LEN,
+    AUTOTUNE_B,
+    stride_ak,
+    stride_bk,
+    stride_ob,
+    stride_om,
+    stride_on,
+    stride_orb,
+    stride_orn,
+    REDUCE_JAGGEDB: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    K_CHUNK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    off_m = tl.program_id(0).to(tl.int64)
+    off_n = tl.program_id(1)
+    off_z = tl.program_id(2)
+
+    tiles_per_batch = tl.cdiv(MAX_SEQ_LEN, K_CHUNK)
+    off_b = off_z // tiles_per_batch
+    if off_b >= AUTOTUNE_B:
+        return
+    k_tile = off_z % tiles_per_batch
+    k_start = (k_tile * K_CHUNK).to(tl.int64)
+
+    seq_start = tl.load(seq_offsets + off_b).to(tl.int64)
+    seq_end = tl.load(seq_offsets + off_b + 1)
+    seq_len = seq_end - seq_start
+
+    if k_start >= seq_len:
+        return
+
+    chunk_len = tl.minimum(seq_len - k_start, K_CHUNK)
+
+    start_m = off_m * BLOCK_M
+    start_n = off_n * BLOCK_N
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    if REDUCE_JAGGEDB:
+        acc_reduce = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    row0 = seq_start + k_start
+    JaggedA += row0 * stride_ak
+    JaggedB += row0 * stride_bk
+    jg_a_ptrs = JaggedA + offs_k[None, :] * stride_ak + (start_m + offs_m)[:, None]
+    jg_b_ptrs = JaggedB + offs_k[:, None] * stride_bk + offs_n[None, :]
+
+    for k in range(0, chunk_len, BLOCK_K):
+        jg_a = tl.load(
+            jg_a_ptrs,
+            mask=(offs_m[:, None] < (M - start_m))
+            & ((k + offs_k)[None, :] < chunk_len),
+            other=0.0,
+        )
+        jg_b = tl.load(
+            jg_b_ptrs,
+            mask=(offs_n[None, :] < N) & ((k + offs_k)[:, None] < chunk_len),
+            other=0.0,
+        )
+        accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
+        if REDUCE_JAGGEDB:
+            if off_m == 0:
+                # pyrefly: ignore [unbound-name]
+                acc_reduce += tl.sum(jg_b.to(tl.float32), axis=0)
+        jg_a_ptrs += BLOCK_K * stride_ak
+        jg_b_ptrs += BLOCK_K * stride_bk
+
+    Out += off_b.to(tl.int64) * stride_ob + start_m * stride_om
+    out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.atomic_add(
+        out_ptrs,
+        accumulator,
+        mask=(offs_m[:, None] < (M - start_m)) & (offs_n[None, :] < N),
+    )
+    if REDUCE_JAGGEDB:
+        if off_m == 0:
+            out_reduce_ptrs = (
+                ReduceOut + off_b.to(tl.int64) * stride_orb + offs_n * stride_orn
+            )
+            tl.atomic_add(
+                out_reduce_ptrs,
+                acc_reduce,  # pyre-ignore [61]
+                mask=(offs_n < N),
+            )
+
+
 class _JaggedDenseBmmFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -912,7 +1046,7 @@ def triton_jagged_dense_bmm_add_bwd_jagged(
     return d_jagged
 
 
-def triton_jagged_dense_bmm_add_bwd_dense_bias(
+def _triton_jagged_dense_bmm_add_bwd_dense_bias_base(
     max_seq_len: int,
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
@@ -966,6 +1100,101 @@ def triton_jagged_dense_bmm_add_bwd_dense_bias(
     return d_dense, d_bias
 
 
+def _should_use_splitk_jagged_dense_bmm_bwd(
+    max_seq_len: int,
+    B: int,
+) -> bool:
+    # B200 benchmark crossover for split-K: max_seq_len / B >= 32K.
+    return max_seq_len >= 32768 * B
+
+
+def _triton_jagged_dense_bmm_add_bwd_dense_bias_splitk(
+    max_seq_len: int,
+    seq_offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    d_dense: torch.Tensor,
+    B: int,
+    K: int,
+    N: int,
+    d_out: torch.Tensor,
+    elementwise: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    autotune_max_len = autotune_max_seq_len(max_seq_len)
+    out_f32 = torch.zeros((B, K, N), device=d_dense.device, dtype=torch.float32)
+    bias_f32 = torch.zeros((B, N), device=d_out.device, dtype=torch.float32)
+    reduce_jaggedb = not elementwise
+
+    def grid(meta):
+        return (
+            triton.cdiv(K, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+            B * triton.cdiv(max_seq_len, meta["K_CHUNK"]),
+        )
+
+    _jagged_jagged_bmm_reduce_sum_splitk[grid](
+        seq_offsets=seq_offsets,
+        JaggedA=jagged,
+        JaggedB=d_out,
+        Out=out_f32,
+        ReduceOut=bias_f32,
+        M=K,
+        N=N,
+        MAX_SEQ_LEN=max_seq_len,
+        AUTOTUNE_MAX_SEQ_LEN=autotune_max_len,
+        AUTOTUNE_B=B,
+        stride_ak=jagged.stride(0),
+        stride_bk=d_out.stride(0),
+        stride_ob=out_f32.stride(0),
+        stride_om=out_f32.stride(1),
+        stride_on=out_f32.stride(2),
+        stride_orb=bias_f32.stride(0),
+        stride_orn=bias_f32.stride(1),
+        REDUCE_JAGGEDB=reduce_jaggedb,
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+    )
+
+    d_dense.copy_(out_f32.to(d_dense.dtype))
+    d_bias = d_out if elementwise else bias_f32.to(d_out.dtype)
+    return d_dense, d_bias
+
+
+def triton_jagged_dense_bmm_add_bwd_dense_bias(
+    max_seq_len: int,
+    seq_offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    d_dense: torch.Tensor,
+    B: int,
+    K: int,
+    N: int,
+    d_out: torch.Tensor,
+    elementwise: bool,
+    use_splitk: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if use_splitk and _should_use_splitk_jagged_dense_bmm_bwd(max_seq_len, B):
+        return _triton_jagged_dense_bmm_add_bwd_dense_bias_splitk(
+            max_seq_len,
+            seq_offsets,
+            jagged,
+            d_dense,
+            B,
+            K,
+            N,
+            d_out,
+            elementwise,
+        )
+    return _triton_jagged_dense_bmm_add_bwd_dense_bias_base(
+        max_seq_len,
+        seq_offsets,
+        jagged,
+        d_dense,
+        B,
+        K,
+        N,
+        d_out,
+        elementwise,
+    )
+
+
 class _JaggedDenseBmmAddFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -1001,6 +1230,7 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
         ctx.K = K
         ctx.N = N
         ctx.elementwise = elementwise
+        ctx.use_splitk_bwd = get_use_splitk_jagged_dense_bmm_bwd()
         return out
 
     @staticmethod
@@ -1041,6 +1271,7 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
                 ctx.N,
                 d_out,
                 ctx.elementwise,
+                ctx.use_splitk_bwd,
             )
 
         return None, None, d_jagged, d_dense, d_bias, None
