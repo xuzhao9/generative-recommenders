@@ -33,14 +33,17 @@ try:
     from hammer.ops.triton.cc.hstu_attention.triton_cc_hstu_attention import (
         triton_cc_hstu_mha,
     )
+except ImportError:
+    from generative_recommenders.ops.triton.triton_hstu_attention import (
+        triton_hstu_mha as triton_cc_hstu_mha,
+    )
+
+try:
     from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import (
         tlx_bw_hstu_mha_wrapper,
     )
 except ImportError:
     tlx_bw_hstu_mha_wrapper = None
-    from generative_recommenders.ops.triton.triton_hstu_attention import (
-        triton_hstu_mha as triton_cc_hstu_mha,
-    )
 from torch.fx._symbolic_trace import is_fx_tracing
 
 torch.fx.wrap("triton_hstu_mha")
